@@ -10,14 +10,17 @@ import { userRouter } from "./routes/user.routes.js"
 import { todoRouter } from "./routes/todo.routes.js"
 import { invitationRouter } from "./routes/invitation.routes.js"
 import { subTodoRouter } from "./routes/subTodo.routes.js"
+import { connectRedis } from "./config/redis.js"
 
 const app = express()
 const PORT = process.env.PORT || 4000
 
 // MongoDB connection
 connectDB()
+connectRedis()
 
 app.use(cookieParser())
+app.set("trust proxy", true);
 app.use(express.json())
 app.use(cors({
       origin: ["https://collaborative-todo-app-l4vy.vercel.app", "http://localhost:5173"],

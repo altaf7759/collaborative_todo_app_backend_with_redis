@@ -1,8 +1,10 @@
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken"
+
 import { User } from "../models/user.models.js";
 import { transporter } from "../services/emailService.js";
 import { welcomeEmail } from "../utils/emailTemplate.js";
+import redisClient from "../config/redis.js";
 
 export const registerUser = async (req, res) => {
       try {
@@ -52,69 +54,129 @@ export const registerUser = async (req, res) => {
 
 export const loginUser = async (req, res) => {
       try {
-            const { identifier, password } = req.body
+            const { identifier, password } = req.body;
 
-            // Check for inputs
             if (!identifier || !password) {
                   return res.status(400).json({
                         success: false,
-                        message: "Missing values"
-                  })
+                        message: "Invalid credentials"
+                  });
             }
 
-            // Check for user in database
+            let ip =
+                  req.headers["x-forwarded-for"]?.split(",")[0] ||
+                  req.socket.remoteAddress ||
+                  "unknown";
+
+            // remove IPv6 prefix if exists
+            ip = ip.replace(/^::ffff:/, "");
+
+            const ipKey = `login_ip_attempts:${ip}`;
+
+            // 🔒 1️⃣ IP Rate Limiting (20 attempts per minute)
+            const ipAttempts = await redisClient.incr(ipKey);
+
+            if (ipAttempts === 1) {
+                  await redisClient.expire(ipKey, 60); // 1 minute window
+            }
+
+            if (ipAttempts > 20) {
+                  return res.status(429).json({
+                        success: false,
+                        message: "Too many login attempts. Try again later."
+                  });
+            }
+
+            // 🔍 2️⃣ Find User (No enumeration)
             const user = await User.findOne({
                   $or: [{ email: identifier }, { userName: identifier }]
-            })
+            });
 
             if (!user) {
-                  return res.status(404).json({
-                        success: false,
-                        message: "User not found"
-                  })
-            }
-
-            // Check for password match
-            const isPasswordMatch = await bcrypt.compare(password, user.password)
-
-            if (!isPasswordMatch) {
+                  // Still counts toward IP limit
                   return res.status(401).json({
                         success: false,
                         message: "Invalid credentials"
-                  })
+                  });
             }
 
-            // Create token
-            const token = jwt.sign({
-                  userId: user._id,
-                  userName: user.userName,
-                  email: user.email
-            },
-                  process.env.JWT_SECRET,
-                  {
-                        expiresIn: "1d"
-                  }
-            )
+            const userAttemptKey = `login_attempts:${user._id}`;
+            const userLockKey = `lock_login:${user._id}`;
 
-           res.cookie("token", token, {
-              httpOnly: true,
-              secure: true,       // MUST be true for SameSite=None
-              sameSite: "none",   // allow cross-site
-              maxAge: 24 * 60 * 60 * 1000
-            }).status(200).json({
+            // 🔒 3️⃣ Check User Lock
+            const isLocked = await redisClient.get(userLockKey);
+
+            if (isLocked) {
+                  const ttl = await redisClient.ttl(userLockKey);
+                  return res.status(403).json({
+                        success: false,
+                        message: `Account locked. Try again after ${Math.ceil(ttl / 60)} minutes.`
+                  });
+            }
+
+            // 🔐 4️⃣ Validate Password
+            const isPasswordMatch = await bcrypt.compare(password, user.password);
+
+            if (!isPasswordMatch) {
+
+                  const attempts = await redisClient.incr(userAttemptKey);
+
+                  if (attempts === 1) {
+                        await redisClient.expire(userAttemptKey, 600); // 10 min window
+                  }
+
+                  if (attempts >= 5) {
+                        await redisClient.set(userLockKey, "locked", { EX: 1800 }); // 30 min lock
+                        await redisClient.del(userAttemptKey);
+
+                        return res.status(403).json({
+                              success: false,
+                              message: "Account locked for 30 minutes due to multiple failed attempts."
+                        });
+                  }
+
+                  return res.status(401).json({
+                        success: false,
+                        message: `Invalid credentials. ${5 - attempts} attempts remaining.`
+                  });
+            }
+
+            // ✅ 5️⃣ Successful Login → Clean up
+            await redisClient.del(userAttemptKey);
+            await redisClient.del(userLockKey);
+
+            const token = jwt.sign(
+                  {
+                        userId: user._id,
+                        userName: user.userName,
+                        email: user.email
+                  },
+                  process.env.JWT_SECRET,
+                  { expiresIn: "1d" }
+            );
+
+            res.cookie("token", token, {
+                  httpOnly: true,
+                  secure: true,
+                  sameSite: "none",
+                  maxAge: 24 * 60 * 60 * 1000
+            });
+
+            return res.status(200).json({
                   success: true,
-                  message: "Login Successfully",
+                  message: "Login successful",
                   user
-            })
+            });
 
       } catch (error) {
-            console.log(error)
-            res.status(500).json({
+            console.error(error);
+            return res.status(500).json({
                   success: false,
                   message: "Server error while login"
-            })
+            });
       }
-}
+};
+
 
 export const logoutUser = async (req, res) => {
       try {
@@ -147,14 +209,38 @@ export const generateOtp = async (req, res) => {
                   });
             }
 
-            const otp = Math.floor(100000 + Math.random() * 900000); // 6-digit OTP
-            const otpExpiry = Date.now() + 10 * 60 * 1000; // valid for 10 minutes
+            // 🔒 Check if user is locked
+            const lockKey = `otp_lock:${userId}`;
+            const isLocked = await redisClient.get(lockKey);
 
-            user.otp = otp;
-            user.otpExpiresAt = otpExpiry;
-            await user.save();
+            if (isLocked) {
+                  const ttl = await redisClient.ttl(lockKey); // remaining seconds
+                  return res.status(400).json({
+                        success: false,
+                        message: `Too many failed attempts. Try again after ${Math.ceil(ttl / 60)} minutes.`
+                  });
+            }
 
-            // Send OTP via email
+            // ⛔ Prevent multiple OTP generation within 10 mins
+            const existingOtp = await redisClient.get(`otp:${userId}`);
+            if (existingOtp) {
+                  return res.status(400).json({
+                        success: false,
+                        message: "OTP already sent. Please wait."
+                  });
+            }
+
+            const otp = Math.floor(100000 + Math.random() * 900000);
+
+            const hashedOtp = await bcrypt.hash(otp.toString(), 5);
+
+            // Save OTP (10 mins)
+            await redisClient.set(`otp:${userId}`, hashedOtp, { EX: 600 });
+
+            // Initialize attempts counter
+            await redisClient.set(`otp_attempts:${userId}`, 0, { EX: 600 });
+
+            // Send Email
             await transporter.sendMail({
                   from: process.env.SENDER_EMAIL,
                   to: user.email,
@@ -176,6 +262,7 @@ export const generateOtp = async (req, res) => {
       }
 };
 
+
 export const resetPassword = async (req, res) => {
       try {
             const { otp, newPassword } = req.body;
@@ -196,36 +283,55 @@ export const resetPassword = async (req, res) => {
                   });
             }
 
-            if (!user.otp || !user.otpExpiresAt) {
+            const otpKey = `otp:${userId}`;
+            const attemptsKey = `otp_attempts:${userId}`;
+            const lockKey = `otp_lock:${userId}`;
+
+            const otpRedis = await redisClient.get(otpKey);
+
+            if (!otpRedis) {
                   return res.status(400).json({
                         success: false,
-                        message: "OTP not generated. Please request a new one."
+                        message: "OTP expired or not generated."
                   });
             }
 
-            if (user.otp !== otp) {
+            const isOtpValid = await bcrypt.compare(otp.toString(), otpRedis);
+
+            if (!isOtpValid) {
+
+                  // 🔺 Increment attempts
+                  const attempts = await redisClient.incr(attemptsKey);
+
+                  if (attempts >= 5) {
+                        // 🔒 Lock user for 30 mins
+                        await redisClient.set(lockKey, "locked", { EX: 1800 });
+
+                        // Cleanup
+                        await redisClient.del(otpKey);
+                        await redisClient.del(attemptsKey);
+
+                        return res.status(400).json({
+                              success: false,
+                              message: "Too many failed attempts. You are locked for 30 minutes."
+                        });
+                  }
+
                   return res.status(400).json({
                         success: false,
-                        message: "Invalid OTP"
+                        message: `Invalid OTP. ${5 - attempts} attempts remaining.`
                   });
             }
 
-            if (user.otpExpiresAt < Date.now()) {
-                  return res.status(400).json({
-                        success: false,
-                        message: "OTP has expired. Please request a new one."
-                  });
-            }
+            // ✅ OTP is valid
 
-            // Hash the new password
             const salt = await bcrypt.genSalt(10);
             user.password = await bcrypt.hash(newPassword, salt);
-
-            // Clear OTP fields
-            user.otp = undefined;
-            user.otpExpiresAt = undefined;
-
             await user.save();
+
+            // Cleanup
+            await redisClient.del(otpKey);
+            await redisClient.del(attemptsKey);
 
             res.status(200).json({
                   success: true,
